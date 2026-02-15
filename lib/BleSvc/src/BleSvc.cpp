@@ -1,7 +1,13 @@
 #include "BleSvc.h"
 #include "config.h"
+#if GEO_ENABLED
+#include "GeoSvc.h"
+#endif
+#include "TimeSvc.h"
 
 #include <NimBLEDevice.h>
+#include <ArduinoJson.h>
+#include <string.h>
 
 // ---- simple line assembler for RX ----
 static String g_rxLineBuf;
@@ -16,24 +22,85 @@ static void nus_send_json_line(const String& jsonLine) {
   g_txChar->notify();
 }
 
-// Build device info JSON (dummy values for now)
-static String build_device_info_json() {
-  const String devName = BLE_DEVICE_NAME;
-  const String serial = "HELTEC-001";
-  int battery = 87;               // %
-  float temperature = 23.4f;      // °C
-  int brightness = 60;            // %
-  String position = "47.12,8.55"; // dummy lat,lon
+// Mode string <-> enum helpers
+static const char* const MODE_STRINGS[] = {
+  "off", "steady", "blink_async", "blink_sync", "blink_backlight"
+};
+static const size_t MODE_COUNT = sizeof(MODE_STRINGS) / sizeof(MODE_STRINGS[0]);
 
-  String json = "{";
-  json += "\"devicename\":\"" + devName + "\",";
-  json += "\"serial\":\"" + serial + "\",";
-  json += "\"battery\":" + String(battery) + ",";
-  json += "\"position\":\"" + position + "\",";
-  json += "\"brightness\":" + String(brightness) + ",";
-  json += "\"temperature\":" + String(temperature, 1);
-  json += "}";
+static bool parseModeStr(const char* str, DeviceMode& out) {
+  for (size_t i = 0; i < MODE_COUNT; i++) {
+    if (strcmp(str, MODE_STRINGS[i]) == 0) {
+      out = static_cast<DeviceMode>(i);
+      return true;
+    }
+  }
+  return false;
+}
+
+static const char* modeToStr(DeviceMode m) {
+  if (m < MODE_COUNT) return MODE_STRINGS[m];
+  return "off";
+}
+
+static String build_device_info_json() {
+  JsonDocument doc;
+  doc["devicename"] = BLE_DEVICE_NAME;
+  doc["sn"] = g_devCfg.sn;
+  doc["devId"] = g_devCfg.devId;
+  doc["mode"] = modeToStr(g_devCfg.mode);
+#if GEO_ENABLED
+  doc["position"] = GeoSvc::valid() ? GeoSvc::position() : "0,0";
+#else
+  doc["position"] = "0,0";
+#endif
+  doc["temperature"] = 23.4f;
+  doc["humidity"] = 55.0f;
+  char timeBuf[16];
+  TimeSvc::formatHHMMSS(timeBuf, sizeof(timeBuf));
+  doc["time"] = timeBuf;
+
+  String json;
+  serializeJson(doc, json);
   return json;
+}
+
+static void handle_set_config(JsonDocument& doc) {
+  // Parse optional fields
+  if (doc["sn"].is<const char*>()) {
+    strncpy(g_devCfg.sn, doc["sn"].as<const char*>(), sizeof(g_devCfg.sn) - 1);
+    g_devCfg.sn[sizeof(g_devCfg.sn) - 1] = '\0';
+  }
+
+  if (doc["devId"].is<int>()) {
+    g_devCfg.devId = doc["devId"].as<uint8_t>();
+  }
+
+  if (doc["mode"].is<const char*>()) {
+    DeviceMode m;
+    if (!parseModeStr(doc["mode"].as<const char*>(), m)) {
+      nus_send_json_line("{\"error\":\"invalid mode\"}");
+      return;
+    }
+    g_devCfg.mode = m;
+  }
+
+  // Mark device as configured → transitions from CONFIG to RUN mode
+  g_configured = true;
+
+  // Serial output
+  Serial.printf("[BLE] set_config: sn=\"%s\" devId=%u mode=%s\n",
+                g_devCfg.sn, g_devCfg.devId, modeToStr(g_devCfg.mode));
+
+  // ACK response
+  JsonDocument ack;
+  ack["ack"] = true;
+  ack["sn"] = g_devCfg.sn;
+  ack["devId"] = g_devCfg.devId;
+  ack["mode"] = modeToStr(g_devCfg.mode);
+  String ackJson;
+  serializeJson(ack, ackJson);
+  nus_send_json_line(ackJson);
 }
 
 // ---- RX callback ----
@@ -65,8 +132,18 @@ private:
         line.trim();
         if (line.length() == 0) return;
 
-        if (line.indexOf("\"cmd\"") >= 0 && line.indexOf("get_info") >= 0) {
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, line);
+        if (err) {
+          nus_send_json_line("{\"error\":\"invalid json\"}");
+          return;
+        }
+
+        const char* cmd = doc["cmd"] | "";
+        if (strcmp(cmd, "get_info") == 0) {
           nus_send_json_line(build_device_info_json());
+        } else if (strcmp(cmd, "set_config") == 0) {
+          handle_set_config(doc);
         } else {
           nus_send_json_line("{\"error\":\"unknown_cmd\"}");
         }

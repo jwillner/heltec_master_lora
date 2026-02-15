@@ -20,10 +20,7 @@ void formatHHMMSS(char* out, size_t len) {
   strftime(out, len, "%H:%M:%S", &t);
 }
 
-void syncOnce(const char* ssid,
-              const char* pass,
-              const char* tzInfo,
-              void (*logFn)(const String&)) {
+bool wifiConnect(const char* ssid, const char* pass, void (*logFn)(const String&)) {
   if (logFn) logFn("WLAN verbinden...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, pass);
@@ -35,24 +32,38 @@ void syncOnce(const char* ssid,
   if (WiFi.status() != WL_CONNECTED) {
     if (logFn) logFn("WLAN FAIL");
     WiFi.mode(WIFI_OFF);
-    return;
+    return false;
   }
+  return true;
+}
 
+void wifiDisconnect(void (*logFn)(const String&)) {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  if (logFn) logFn("WLAN aus");
+}
+
+void ntpSync(const char* tzInfo, void (*logFn)(const String&)) {
   if (logFn) logFn("NTP sync...");
   setenv("TZ", tzInfo, 1);
   tzset();
 
   configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
 
-  start = millis();
+  uint32_t start = millis();
   while (!valid() && millis() - start < 12000)
     delay(200);
 
   if (logFn) logFn(valid() ? "Zeit OK" : "NTP Timeout");
+}
 
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  if (logFn) logFn("WLAN aus");
+void syncOnce(const char* ssid,
+              const char* pass,
+              const char* tzInfo,
+              void (*logFn)(const String&)) {
+  if (!wifiConnect(ssid, pass, logFn)) return;
+  ntpSync(tzInfo, logFn);
+  wifiDisconnect(logFn);
 }
 
 }
